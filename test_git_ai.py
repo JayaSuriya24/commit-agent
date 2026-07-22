@@ -1,9 +1,11 @@
 import json
+import os
 import subprocess
 
 import pytest
 
 import git_ops
+import main
 from domain_chunker import chunk_by_domain, classify_path
 from git_diff_parser import (
     build_combined_patch,
@@ -398,3 +400,224 @@ def test_extract_ticket_id(branch, expected):
 def test_build_commit_body():
     assert git_ops.build_commit_body("PROJ-104") == "Refs: PROJ-104"
     assert git_ops.build_commit_body(None) is None
+
+
+# --------------------------------------------------------------------------
+# Crash protection
+# --------------------------------------------------------------------------
+
+
+def test_backup_survives_simulated_crash_and_restores(git_repo, monkeypatch):
+    """Kill the process after the reset: staging must be recoverable."""
+    repo, git = git_repo
+    monkeypatch.chdir(repo)
+    (repo / "app.py").write_text("import os\nimport sys\nprint(os.getcwd())\n")
+    git("add", "-A")
+    original = git("diff", "--cached").stdout
+
+    main.create_emergency_backup()
+    assert os.path.exists(main.backup_patch_path())
+
+    git("reset", "-q")  # simulate the crash window: index cleared, then death
+    assert git("diff", "--cached", "--quiet").returncode == 0
+
+    monkeypatch.setattr("builtins.input", lambda _: "y")
+    main.check_for_recovery()
+
+    assert git("diff", "--cached").stdout == original
+    assert not os.path.exists(main.backup_patch_path())  # cleaned after success
+
+
+def test_backup_is_binary_safe(git_repo, monkeypatch):
+    """A plain `git diff --cached` would drop binary content from the backup."""
+    repo, git = git_repo
+    monkeypatch.chdir(repo)
+    (repo / "logo.png").write_bytes(b"\x89PNG\r\n\x1a\n\x00\x01\x02\x03blob")
+    git("add", "-A")
+
+    main.create_emergency_backup()
+    patch = open(main.backup_patch_path(), encoding="utf-8").read()
+    assert "GIT binary patch" in patch
+
+    git("reset", "-q")
+    monkeypatch.setattr("builtins.input", lambda _: "y")
+    main.check_for_recovery()
+
+    assert git("diff", "--cached", "--name-only").stdout.strip() == "logo.png"
+    assert (repo / "logo.png").read_bytes().startswith(b"\x89PNG")
+
+
+def test_failed_restore_keeps_the_backup(git_repo, monkeypatch):
+    """The backup is the only copy: never delete it on a failed apply."""
+    repo, git = git_repo
+    monkeypatch.chdir(repo)
+    path = os.path.join(git_ops.git_dir(), main.BACKUP_PATCH_NAME)
+    with open(path, "w") as f:
+        f.write("this is not a valid patch\n")
+
+    monkeypatch.setattr("builtins.input", lambda _: "y")
+    main.check_for_recovery()
+
+    assert os.path.exists(path), "backup was deleted despite the restore failing"
+
+
+def test_recovery_declined_keeps_backup(git_repo, monkeypatch):
+    """Answering anything but y/d leaves the file for a later decision."""
+    repo, git = git_repo
+    monkeypatch.chdir(repo)
+    (repo / "app.py").write_text("changed\n")
+    git("add", "-A")
+    main.create_emergency_backup()
+
+    monkeypatch.setattr("builtins.input", lambda _: "n")
+    main.check_for_recovery()
+    assert os.path.exists(main.backup_patch_path())
+
+    monkeypatch.setattr("builtins.input", lambda _: "d")
+    main.check_for_recovery()
+    assert not os.path.exists(main.backup_patch_path())
+
+
+def test_refresh_backup_drops_committed_chunks(git_repo, monkeypatch):
+    """After a chunk lands, HEAD moved: the backup must shrink to what's left."""
+    repo, git = git_repo
+    monkeypatch.chdir(repo)
+    (repo / "app.py").write_text("import os\nimport sys\nprint(os.getcwd())\n")
+    (repo / "notes.md").write_text("# Notes\n\nMore.\n")
+    git("add", "-A")
+
+    chunks = chunk_by_domain(parse_git_diff(git("diff", "--cached").stdout))
+    main.create_emergency_backup()
+
+    main.refresh_backup(chunks[1:])  # pretend chunks[0] was committed
+    patch = open(main.backup_patch_path(), encoding="utf-8").read()
+    assert chunks[1]["paths"][0] in patch
+    assert chunks[0]["paths"][0] not in patch
+
+    main.refresh_backup([])  # nothing left -> backup removed
+    assert not os.path.exists(main.backup_patch_path())
+
+
+def test_stale_backup_recovers_after_a_chunk_already_committed(git_repo, monkeypatch):
+    """The real crash window: killed between `git commit` and the backup refresh.
+
+    The backup then names a change that is already in HEAD. A strict apply
+    rejects the whole patch; the 3-way restore must skip the committed file and
+    re-stage only what is genuinely uncommitted.
+    """
+    repo, git = git_repo
+    monkeypatch.chdir(repo)
+    (repo / "app.py").write_text("import os\nimport sys\nprint(os.getcwd())\n")
+    (repo / "notes.md").write_text("# Notes\n\nMore.\n")
+    git("add", "-A")
+
+    chunks = chunk_by_domain(parse_git_diff(git("diff", "--cached").stdout))
+    main.create_emergency_backup()  # backup covers BOTH files
+    git("reset", "-q")
+
+    # One chunk lands, then the process dies before refresh_backup() runs.
+    git("apply", "--cached", "-", input=chunks[0]["patch"])
+    git("commit", "-q", "-m", "docs: notes")
+    committed_path = chunks[0]["paths"][0]
+
+    backup = open(main.backup_patch_path(), encoding="utf-8").read()
+    assert committed_path in backup, "precondition: backup is stale"
+
+    monkeypatch.setattr("builtins.input", lambda _: "y")
+    main.check_for_recovery()
+
+    staged = git_ops.staged_paths()
+    assert staged == chunks[1]["paths"], f"expected only the uncommitted chunk, got {staged}"
+    assert not os.path.exists(main.backup_patch_path())
+
+
+def test_backup_path_resolves_from_a_subdirectory(git_repo, monkeypatch):
+    """A hardcoded '.git/...' would crash or write a stray file from a subdir."""
+    repo, git = git_repo
+    subdir = repo / "src" / "deep"
+    subdir.mkdir(parents=True)
+    monkeypatch.chdir(subdir)
+
+    path = main.backup_patch_path()
+    assert os.path.isabs(path)
+    assert os.path.dirname(path) == str(repo / ".git")
+
+
+# --------------------------------------------------------------------------
+# CLI flags and hook (--suggest) mode
+# --------------------------------------------------------------------------
+
+
+def test_args_default_to_interactive_committing():
+    opts = main._parse_args([])
+    assert opts.yes is False
+    assert opts.dry_run is False
+    assert opts.suggest is None
+    assert opts.model  # a default model is set
+
+
+def test_args_parse_flags():
+    opts = main._parse_args(["--yes", "--model", "llama3", "--suggest", "MSG"])
+    assert opts.yes and opts.model == "llama3" and opts.suggest == "MSG"
+
+
+def _stub_llm(monkeypatch, text="feat(x): generated"):
+    monkeypatch.setattr(main, "generate_commit_message", lambda *a, **k: text)
+
+
+def test_suggest_fills_empty_template_and_keeps_comments(tmp_path, monkeypatch):
+    _stub_llm(monkeypatch)
+    msg = tmp_path / "COMMIT_EDITMSG"
+    msg.write_text("\n# Please enter a commit message.\n# Lines with # are ignored.\n")
+    opts = main._parse_args(["--suggest", str(msg)])
+
+    parsed = parse_git_diff(SAMPLE_RAW_DIFF)
+    assert main._suggest_only(parsed, "Refs: X-1", opts) == 0
+
+    content = msg.read_text()
+    assert content.startswith("feat(x): generated\n")
+    assert "# Please enter a commit message." in content  # git's block preserved
+
+
+def test_suggest_never_clobbers_a_real_message(tmp_path, monkeypatch):
+    """A -m/merge/amend message already in the file must survive untouched."""
+    _stub_llm(monkeypatch)
+    msg = tmp_path / "COMMIT_EDITMSG"
+    msg.write_text("my hand-written message\n\n# a comment\n")
+    opts = main._parse_args(["--suggest", str(msg)])
+
+    main._suggest_only(parse_git_diff(SAMPLE_RAW_DIFF), None, opts)
+    assert msg.read_text() == "my hand-written message\n\n# a comment\n"
+
+
+def test_suggest_leaves_file_alone_when_inference_fails(tmp_path, monkeypatch):
+    """A hook must never block the commit: on LLM failure, don't touch the file."""
+
+    def boom(*a, **k):
+        raise OllamaError("ollama down")
+
+    monkeypatch.setattr(main, "generate_commit_message", boom)
+    msg = tmp_path / "COMMIT_EDITMSG"
+    msg.write_text("\n# template\n")
+    opts = main._parse_args(["--suggest", str(msg)])
+
+    assert main._suggest_only(parse_git_diff(SAMPLE_RAW_DIFF), None, opts) == 0
+    assert msg.read_text() == "\n# template\n"  # unchanged, git falls back
+
+
+def test_dry_run_and_yes_skip_on_llm_failure_without_prompting(monkeypatch):
+    """Non-interactive modes must not call input() when generation fails."""
+
+    def boom(*a, **k):
+        raise OllamaError("down")
+
+    monkeypatch.setattr(main, "generate_commit_message", boom)
+
+    def no_input(_):
+        raise AssertionError("input() must not be called in non-interactive mode")
+
+    monkeypatch.setattr("builtins.input", no_input)
+    chunk = {"files": [], "domain": "x", "scope_hint": None, "type_hint": None}
+
+    assert main._resolve_message(chunk, None, main._parse_args(["--yes"])) is None
+    assert main._resolve_message(chunk, None, main._parse_args(["--dry-run"])) is None

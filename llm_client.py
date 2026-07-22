@@ -7,6 +7,8 @@ from typing import Any, Dict, Optional
 
 OLLAMA_URL = "http://localhost:11434/api/generate"
 
+DEFAULT_MODEL = "qwen2.5-coder:1.5b"
+
 VALID_TYPES = ("feat", "fix", "docs", "style", "refactor", "test", "chore")
 
 SUBJECT_MAX = 72
@@ -80,7 +82,7 @@ def build_commit_message(
 
 def generate_commit_message(
     diff_payload: str,
-    model: str = "qwen2.5-coder:1.5b",
+    model: str = DEFAULT_MODEL,
     scope_hint: Optional[str] = None,
     type_hint: Optional[str] = None,
     body: Optional[str] = None,
