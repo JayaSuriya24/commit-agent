@@ -1,2 +1,2 @@
-print('Hello world from AI CLI')
+print('Hello world')
 print('Added a second line')
