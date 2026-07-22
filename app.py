@@ -1,8 +1,1 @@
-print('Hello world')
-print('Added a second line')
-print('Added a second line')
-print('Added a second line')
-print('Added a second line')
-print('Added a third line')
 print('My name is jaya suriya M')
-print('add user profile picture upload')
